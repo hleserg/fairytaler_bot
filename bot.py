@@ -349,7 +349,8 @@ async def audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(e) == 'TTS_TEXT_TOO_LONG':
             await update.message.reply_text("Эта сказка слишком длинная. Я не смогу ее прочитать.")
         else:
-            await update.message.reply_text(f"Ошибка синтеза: {e}")
+            await update.message.reply_text(f"Не удалось синтезировать аудио, простите. Попробуйте позже.")
+            logging.error(f"Ошибка синтеза аудио: {e}")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
