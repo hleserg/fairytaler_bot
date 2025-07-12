@@ -16,7 +16,42 @@ NEUROAPI_URL = 'https://neuroapi.host/v1/chat/completions'
 MODEL = 'gemini-2.5-pro'
 
 folder_id = os.getenv('YANDEX_FOLDER_ID')
-iam_token = os.getenv('YANDEX_IAM_TOKEN')
+# iam_token теперь будет обновляться автоматически
+iam_token = None
+
+# --- Получение IAM токена через yc CLI ---
+def fetch_iam_token():
+    try:
+        result = subprocess.run(['yc', 'iam', 'create-token'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+        if result.returncode == 0:
+            token = result.stdout.strip()
+            if token:
+                logging.info('IAM токен успешно получен через yc CLI')
+                return token
+            else:
+                logging.error('Пустой IAM токен от yc CLI')
+        else:
+            logging.error(f'Ошибка yc CLI: {result.stderr}')
+    except Exception as e:
+        logging.error(f'Ошибка получения IAM токена: {e}')
+    return None
+
+# --- Планировщик для обновления токена ---
+from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+
+def schedule_iam_token_update():
+    global iam_token
+    def update_token():
+        global iam_token
+        token = fetch_iam_token()
+        if token:
+            iam_token = token
+    update_token()  # Получить токен при запуске
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(update_token, 'interval', hours=24)
+    # Чтобы планировщик работал в фоне
+    threading.Thread(target=scheduler.start, daemon=True).start()
 
 # --- Логирование ---
 logging.basicConfig(level=logging.INFO)
@@ -221,7 +256,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готовлю тестовое аудио...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
     try:
-        ogg_path, mp3_path = await synthesize_tts(test_text, folder_id, iam_token)
+        ogg_path, mp3_path = await synthesize_tts(test_text, folder_id)
         with open(ogg_path, 'rb') as voice:
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice)
         if mp3_path and os.path.exists(mp3_path):
@@ -233,7 +268,13 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"Ошибка синтеза: {e}")
 
-async def synthesize_tts(text, folder_id, iam_token):
+async def synthesize_tts(text, folder_id):
+    global iam_token
+    # Получаем актуальный IAM токен
+    if not iam_token:
+        iam_token = fetch_iam_token()
+        if not iam_token:
+            raise Exception('Не удалось получить IAM токен')
     url = 'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize'
     headers = {
         'Authorization': 'Bearer ' + iam_token,
@@ -294,14 +335,14 @@ async def audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 split_idx = mid
             part1 = story[:split_idx+1].strip()
             part2 = story[split_idx+1:].strip()
-            ogg_path1, _ = await synthesize_tts(part1, folder_id, iam_token)
+            ogg_path1, _ = await synthesize_tts(part1, folder_id)
             with open(ogg_path1, 'rb') as voice1:
                 await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice1)
-            ogg_path2, _ = await synthesize_tts(part2, folder_id, iam_token)
+            ogg_path2, _ = await synthesize_tts(part2, folder_id)
             with open(ogg_path2, 'rb') as voice2:
                 await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice2)
         else:
-            ogg_path, _ = await synthesize_tts(story, folder_id, iam_token)
+            ogg_path, _ = await synthesize_tts(story, folder_id)
             with open(ogg_path, 'rb') as voice:
                 await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice)
     except Exception as e:
@@ -334,6 +375,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main ---
 def main():
+    # Запускаем обновление IAM токена
+    schedule_iam_token_update()
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler('start', start))

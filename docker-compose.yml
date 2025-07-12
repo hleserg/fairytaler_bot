@@ -5,3 +5,6 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      # Монтируем yc config с хоста внутрь контейнера
+      - ~/.config/yandex-cloud:/root/.config/yandex-cloud:ro
