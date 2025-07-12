@@ -227,7 +227,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             story = generate_story(prompt)
         except Exception as e:
-            await query.edit_message_text(f"Ошибка генерации: {e}")
+            await query.edit_message_text(f"Не удалось сгенерировать сказку, простите. Попробуйте позже.")
+            logging.error(f"Ошибка генерации сказки: {e}")
             return
         # Отправляем сказку частями, если она длинная
         max_len = 4096
