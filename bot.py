@@ -9,6 +9,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 import subprocess
+import threading
 
 # --- Конфиг ---
 NEUROAPI_API_KEY = os.getenv('NEUROAPI_API_KEY')
@@ -18,6 +19,8 @@ MODEL = 'gemini-2.5-pro'
 folder_id = os.getenv('YANDEX_FOLDER_ID')
 # iam_token теперь будет обновляться автоматически
 iam_token = None
+# Add a lock for thread-safe access to iam_token
+iam_token_lock = threading.Lock()
 
 # --- Получение IAM токена через yc CLI ---
 def fetch_iam_token():
@@ -38,7 +41,6 @@ def fetch_iam_token():
 
 # --- Планировщик для обновления токена ---
 from apscheduler.schedulers.background import BackgroundScheduler
-import threading
 
 def schedule_iam_token_update():
     global iam_token
@@ -46,7 +48,8 @@ def schedule_iam_token_update():
         global iam_token
         token = fetch_iam_token()
         if token:
-            iam_token = token
+            with iam_token_lock:
+                iam_token = token
     update_token()  # Получить токен при запуске
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_token, 'interval', hours=24)
@@ -135,7 +138,7 @@ def get_prompt(state):
         f"Не используй символы разметки или HTML, только текст сказки."
     )
 
-def generate_story(prompt):
+async def generate_story(prompt):
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {NEUROAPI_API_KEY}"
@@ -146,9 +149,11 @@ def generate_story(prompt):
             {"role": "user", "content": prompt}
         ]
     }
-    resp = requests.post(NEUROAPI_URL, headers=headers, json=data, timeout=300)
-    resp.raise_for_status()
-    return resp.json()['choices'][0]['message']['content']
+    async with aiohttp.ClientSession() as session:
+        async with session.post(NEUROAPI_URL, headers=headers, json=data, timeout=300) as resp:
+            resp.raise_for_status()
+            result = await resp.json()
+            return result['choices'][0]['message']['content']
 
 # --- Хэндлеры ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -176,7 +181,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = USER_STATE.get(user_id)
     if not state:
         reset_user(user_id)
-        state = USER_STATE[user_id]
+        state = USER_STATE.get(user_id)  # Use get instead of direct index for safety
 
     step = state['step']
     data = query.data
@@ -225,7 +230,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=query.message.chat_id, action="typing")
         prompt = get_prompt(state)
         try:
-            story = generate_story(prompt)
+            story = await generate_story(prompt)  # Now async
         except Exception as e:
             await query.edit_message_text(f"Не удалось сгенерировать сказку, простите. Попробуйте позже.")
             logging.error(f"Ошибка генерации сказки: {e}")
@@ -272,13 +277,17 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def synthesize_tts(text, folder_id):
     global iam_token
     # Получаем актуальный IAM токен
-    if not iam_token:
-        iam_token = fetch_iam_token()
-        if not iam_token:
+    with iam_token_lock:
+        token = iam_token
+    if not token:
+        token = fetch_iam_token()
+        if not token:
             raise Exception('Не удалось получить IAM токен')
+        with iam_token_lock:
+            iam_token = token
     url = 'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize'
     headers = {
-        'Authorization': 'Bearer ' + iam_token,
+        'Authorization': 'Bearer ' + token,
     }
     data = {
         'text': text,
