@@ -18,22 +18,43 @@ MODEL = 'gemini-2.5-pro'
 folder_id = os.getenv('YANDEX_FOLDER_ID')
 # iam_token теперь будет обновляться автоматически
 iam_token = None
+# Lock for thread-safe access to iam_token
+iam_token_lock = threading.Lock()
 
 # --- Получение IAM токена через yc CLI ---
 def fetch_iam_token():
     try:
-        result = subprocess.run(['yc', 'iam', 'create-token'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+        # Check if yc command is available
+        yc_check = subprocess.run(['which', 'yc'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if yc_check.returncode != 0:
+            logging.error('yc CLI не найден в системе')
+            return None
+            
+        result = subprocess.run(
+            ['yc', 'iam', 'create-token'], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True, 
+            timeout=30,  # Increased timeout
+            check=False  # Don't raise exception on non-zero exit
+        )
+        
         if result.returncode == 0:
             token = result.stdout.strip()
-            if token:
+            if token and len(token) > 10:  # Basic validation
                 logging.info('IAM токен успешно получен через yc CLI')
                 return token
             else:
-                logging.error('Пустой IAM токен от yc CLI')
+                logging.error('Получен некорректный IAM токен от yc CLI')
         else:
-            logging.error(f'Ошибка yc CLI: {result.stderr}')
+            stderr_msg = result.stderr.strip() if result.stderr else "Неизвестная ошибка"
+            logging.error(f'Ошибка yc CLI (код {result.returncode}): {stderr_msg}')
+    except subprocess.TimeoutExpired:
+        logging.error('Таймаут при получении IAM токена через yc CLI')
+    except FileNotFoundError:
+        logging.error('yc CLI не найден в PATH')
     except Exception as e:
-        logging.error(f'Ошибка получения IAM токена: {e}')
+        logging.error(f'Неожиданная ошибка получения IAM токена: {e}')
     return None
 
 # --- Планировщик для обновления токена ---
@@ -46,12 +67,25 @@ def schedule_iam_token_update():
         global iam_token
         token = fetch_iam_token()
         if token:
-            iam_token = token
+            with iam_token_lock:
+                iam_token = token
+                logging.info('IAM токен обновлен')
+        else:
+            logging.error('Не удалось обновить IAM токен')
+    
     update_token()  # Получить токен при запуске
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(update_token, 'interval', hours=24)
-    # Чтобы планировщик работал в фоне
-    threading.Thread(target=scheduler.start, daemon=True).start()
+    
+    try:
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(update_token, 'interval', hours=24)
+        # Чтобы планировщик работал в фоне
+        scheduler_thread = threading.Thread(target=scheduler.start, daemon=True)
+        scheduler_thread.start()
+        logging.info('Планировщик обновления токена запущен')
+    except Exception as e:
+        logging.error(f'Ошибка запуска планировщика токена: {e}')
+        # Fallback: try to get token immediately if scheduler fails
+        update_token()
 
 # --- Логирование ---
 logging.basicConfig(level=logging.INFO)
@@ -258,11 +292,18 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
     try:
         ogg_path, mp3_path = await synthesize_tts(test_text, folder_id)
-        with open(ogg_path, 'rb') as voice:
-            await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice)
-        if mp3_path and os.path.exists(mp3_path):
-            with open(mp3_path, 'rb') as audio:
-                await context.bot.send_audio(chat_id=update.effective_chat.id, audio=audio, filename='test.mp3')
+        try:
+            with open(ogg_path, 'rb') as voice:
+                await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice)
+            if mp3_path and os.path.exists(mp3_path):
+                with open(mp3_path, 'rb') as audio:
+                    await context.bot.send_audio(chat_id=update.effective_chat.id, audio=audio, filename='test.mp3')
+        finally:
+            # Clean up temporary files
+            if ogg_path and os.path.exists(ogg_path):
+                os.unlink(ogg_path)
+            if mp3_path and os.path.exists(mp3_path):
+                os.unlink(mp3_path)
     except Exception as e:
         if str(e) == 'TTS_TEXT_TOO_LONG':
             await update.message.reply_text("Эта сказка слишком длинная. Я не смогу ее прочитать.")
@@ -271,14 +312,20 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def synthesize_tts(text, folder_id):
     global iam_token
-    # Получаем актуальный IAM токен
-    if not iam_token:
-        iam_token = fetch_iam_token()
-        if not iam_token:
+    # Получаем актуальный IAM токен с thread-safe доступом
+    with iam_token_lock:
+        current_token = iam_token
+    
+    if not current_token:
+        new_token = fetch_iam_token()
+        if not new_token:
             raise Exception('Не удалось получить IAM токен')
+        with iam_token_lock:
+            iam_token = new_token
+            current_token = new_token
     url = 'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize'
     headers = {
-        'Authorization': 'Bearer ' + iam_token,
+        'Authorization': 'Bearer ' + current_token,
     }
     data = {
         'text': text,
@@ -289,32 +336,68 @@ async def synthesize_tts(text, folder_id):
         'format': 'oggopus',
         'sampleRateHertz': 48000
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=data) as resp:
-            if resp.status != 200:
-                err_text = await resp.text()
-                if 'Requested text length exceed limitation' in err_text:
-                    raise Exception('TTS_TEXT_TOO_LONG')
-                raise Exception(f"TTS error: {err_text}")
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.ogg') as f:
-                content = await resp.read()
-                if not content:
-                    raise Exception("TTS API вернул пустой аудиофайл. Попробуйте другой текст или повторите попытку позже.")
-                f.write(content)
-                ogg_path = f.name
-    # Конвертация oggopus -> mp3 через ffmpeg
-    mp3_path = ogg_path.replace('.ogg', '.mp3')
+    
+    ogg_path = None
+    mp3_path = None
+    
     try:
-        result = subprocess.run([
-            'ffmpeg', '-y', '-i', ogg_path, '-acodec', 'libmp3lame', mp3_path
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode != 0 or not os.path.exists(mp3_path):
-            logging.error(f"ffmpeg error: {result.stderr.decode('utf-8')}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=data) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    if 'Requested text length exceed limitation' in err_text:
+                        raise Exception('TTS_TEXT_TOO_LONG')
+                    raise Exception(f"TTS error: {err_text}")
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.ogg') as f:
+                    content = await resp.read()
+                    if not content:
+                        raise Exception("TTS API вернул пустой аудиофайл. Попробуйте другий текст или повторите попытку позже.")
+                    f.write(content)
+                    ogg_path = f.name
+        
+        # Конвертация oggopus -> mp3 через ffmpeg
+        mp3_path = ogg_path.replace('.ogg', '.mp3')
+        try:
+            # Check if ffmpeg is available
+            ffmpeg_check = subprocess.run(['which', 'ffmpeg'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            if ffmpeg_check.returncode != 0:
+                logging.warning('ffmpeg не найден в системе, MP3 конвертация недоступна')
+                mp3_path = None
+            else:
+                result = subprocess.run([
+                    'ffmpeg', '-y', '-i', ogg_path, '-acodec', 'libmp3lame', mp3_path
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+                
+                if result.returncode == 0 and os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                    logging.info('MP3 конвертация успешна')
+                else:
+                    stderr_msg = result.stderr.decode('utf-8', errors='replace') if result.stderr else "Неизвестная ошибка"
+                    logging.error(f"ffmpeg error (код {result.returncode}): {stderr_msg}")
+                    mp3_path = None
+        except subprocess.TimeoutExpired:
+            logging.error("ffmpeg таймаут при конвертации")
             mp3_path = None
+        except FileNotFoundError:
+            logging.warning('ffmpeg не найден в PATH, MP3 конвертация недоступна')
+            mp3_path = None
+        except Exception as e:
+            logging.error(f"ffmpeg exception: {e}")
+            mp3_path = None
+        
+        return ogg_path, mp3_path
     except Exception as e:
-        logging.error(f"ffmpeg exception: {e}")
-        mp3_path = None
-    return ogg_path, mp3_path
+        # Clean up temporary files if an error occurred
+        if ogg_path and os.path.exists(ogg_path):
+            try:
+                os.unlink(ogg_path)
+            except Exception as cleanup_error:
+                logging.error(f"Failed to cleanup ogg file {ogg_path}: {cleanup_error}")
+        if mp3_path and os.path.exists(mp3_path):
+            try:
+                os.unlink(mp3_path)
+            except Exception as cleanup_error:
+                logging.error(f"Failed to cleanup mp3 file {mp3_path}: {cleanup_error}")
+        raise
 
 # --- Команда /audio ---
 async def audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,16 +419,39 @@ async def audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 split_idx = mid
             part1 = story[:split_idx+1].strip()
             part2 = story[split_idx+1:].strip()
-            ogg_path1, _ = await synthesize_tts(part1, folder_id)
-            with open(ogg_path1, 'rb') as voice1:
-                await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice1)
-            ogg_path2, _ = await synthesize_tts(part2, folder_id)
-            with open(ogg_path2, 'rb') as voice2:
-                await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice2)
+            
+            ogg_path1, mp3_path1 = await synthesize_tts(part1, folder_id)
+            try:
+                with open(ogg_path1, 'rb') as voice1:
+                    await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice1)
+            finally:
+                # Clean up temporary files
+                if ogg_path1 and os.path.exists(ogg_path1):
+                    os.unlink(ogg_path1)
+                if mp3_path1 and os.path.exists(mp3_path1):
+                    os.unlink(mp3_path1)
+            
+            ogg_path2, mp3_path2 = await synthesize_tts(part2, folder_id)
+            try:
+                with open(ogg_path2, 'rb') as voice2:
+                    await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice2)
+            finally:
+                # Clean up temporary files
+                if ogg_path2 and os.path.exists(ogg_path2):
+                    os.unlink(ogg_path2)
+                if mp3_path2 and os.path.exists(mp3_path2):
+                    os.unlink(mp3_path2)
         else:
-            ogg_path, _ = await synthesize_tts(story, folder_id)
-            with open(ogg_path, 'rb') as voice:
-                await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice)
+            ogg_path, mp3_path = await synthesize_tts(story, folder_id)
+            try:
+                with open(ogg_path, 'rb') as voice:
+                    await context.bot.send_voice(chat_id=update.effective_chat.id, voice=voice)
+            finally:
+                # Clean up temporary files
+                if ogg_path and os.path.exists(ogg_path):
+                    os.unlink(ogg_path)
+                if mp3_path and os.path.exists(mp3_path):
+                    os.unlink(mp3_path)
     except Exception as e:
         if str(e) == 'TTS_TEXT_TOO_LONG':
             await update.message.reply_text("Эта сказка слишком длинная. Я не смогу ее прочитать.")
