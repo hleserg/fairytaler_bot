@@ -110,6 +110,9 @@ USER_STATE = {}
 # --- Последние сказки пользователей ---
 USER_STORY = {}
 
+# --- Контекст изображений для каждого пользователя ---
+USER_IMAGE_CONTEXT = {}
+
 # --- Хелперы ---
 def build_keyboard(options):
     keyboard = [[InlineKeyboardButton(text, callback_data=val)] for text, val in options]
@@ -124,6 +127,9 @@ def reset_user(user_id):
         'age': None,
         'length': None
     }
+    # Очищаем контекст изображений для нового пользователя
+    if user_id in USER_IMAGE_CONTEXT:
+        del USER_IMAGE_CONTEXT[user_id]
 
 def get_prompt(state):
     length_map = {
@@ -162,22 +168,206 @@ def generate_story(prompt):
     return resp.json()['choices'][0]['message']['content']
 
 # --- Генерация изображений ---
-def create_image_prompt(state, text_part=None):
-    """Создать промпт для генерации изображения"""
-    if text_part:
-        # Промпт на основе последних двух предложений блока
-        # Разделяем текст на предложения
+def init_image_context(user_id, state):
+    """Инициализация контекста изображений для пользователя"""
+    USER_IMAGE_CONTEXT[user_id] = {
+        'hero': state['hero'],
+        'place': state['place'],
+        'mood': state['mood'],
+        'age': state['age'],
+        'scenes': [],
+        'characters': [state['hero']],
+        'locations': [state['place']],
+        'style_notes': []
+    }
+
+def update_image_context(user_id, text_part, scene_description=None):
+    """Обновление контекста изображений новой информацией"""
+    if user_id not in USER_IMAGE_CONTEXT:
+        return
+    
+    context = USER_IMAGE_CONTEXT[user_id]
+    
+    # Добавляем краткое описание сцены
+    if scene_description:
+        context['scenes'].append(scene_description)
+        # Сохраняем только последние 5 сцен для контекста
+        if len(context['scenes']) > 5:
+            context['scenes'] = context['scenes'][-5:]
+
+async def generate_ai_image_prompt(user_id, state, text_part=None, is_initial=False):
+    """Генерация промпта для изображения через AI с учетом контекста"""
+    try:
+        if is_initial:
+            # Для первого изображения используем базовые параметры
+            init_image_context(user_id, state)
+            
+            mood_map = {
+                'спокойное': 'мирная спокойная атмосфера',
+                'волшебное': 'магическая волшебная атмосфера с блестками',
+                'весёлое': 'яркая радостная атмосфера',
+                'поучительное': 'мудрая добрая атмосфера',
+                'фантастическое': 'фантастическая космическая атмосфера',
+                'страшное': 'немного таинственная но не пугающая атмосфера'
+            }
+            mood_desc = mood_map.get(state['mood'], 'добрая атмосфера')
+            return f"детская книжная иллюстрация: {state['hero']} в месте {state['place']}, {mood_desc}, яркие цвета, стиль детской книги"
+        
+        # Для последующих изображений используем AI
+        if user_id not in USER_IMAGE_CONTEXT:
+            init_image_context(user_id, state)
+        
+        context = USER_IMAGE_CONTEXT[user_id]
+        
+        # Извлекаем последние два предложения из текста
         sentences = re.split(r'[.!?]+', text_part)
         sentences = [s.strip() for s in sentences if s.strip()]
         
-        # Берем последние два предложения
+        if len(sentences) >= 2:
+            current_text = '. '.join(sentences[-2:])
+        elif len(sentences) == 1:
+            current_text = sentences[0]
+        else:
+            current_text = text_part[:150] if text_part else ""
+        
+        # Детальный контекстный промпт для AI
+        ai_prompt = f"""Ты эксперт по созданию промптов для генерации детских иллюстраций к сказкам.
+
+КОНТЕКСТ СКАЗКИ:
+- Главный герой: {context['hero']}
+- Основное место действия: {context['place']}
+- Настроение сказки: {context['mood']}
+- Возраст аудитории: {context['age']}
+
+ПРЕДЫДУЩИЕ СЦЕНЫ: {', '.join(context['scenes'][-3:]) if context['scenes'] else 'начало сказки'}
+
+ТЕКУЩИЙ ФРАГМЕНТ ДЛЯ ИЛЛЮСТРАЦИИ: {current_text}
+
+ЗАДАЧА: Создай оптимальный промпт на русском языке для генерации детской книжной иллюстрации, учитывая:
+1. Ключевые визуальные элементы из текущего фрагмента
+2. Единство стиля с предыдущими иллюстрациями
+3. Соответствие общему настроению и героям сказки
+4. Детский добрый стиль книжной иллюстрации
+
+ФОРМАТ ОТВЕТА: Только промпт без дополнительных объяснений, начинающийся с "детская книжная иллюстрация:"
+
+ПРОМПТ:"""
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {NEUROAPI_API_KEY}"
+        }
+        
+        data = {
+            "model": "gpt-4o-mini",  # Переключаемся на более стабильную модель
+            "messages": [
+                {"role": "system", "content": "Ты создаешь короткие промпты для детских иллюстраций. Отвечай ТОЛЬКО промптом, начинающимся с 'детская книжная иллюстрация:'. Никаких рассуждений или объяснений."},
+                {"role": "user", "content": ai_prompt}
+            ],
+            "max_tokens": 200,
+            "temperature": 0.2,
+            "stream": False
+        }
+        
+        logging.info("Генерируем AI промпт для изображения...")
+        logging.info(f"Отправляем AI простой запрос: {ai_prompt}")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(NEUROAPI_URL, headers=headers, json=data) as resp:
+                logging.info(f"Статус ответа от AI: {resp.status}")
+                
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logging.error(f"Ошибка AI промпта (status {resp.status}): {error_text}")
+                    raise Exception(f"AI prompt error: {error_text}")
+                
+                result = await resp.json()
+                logging.info(f"AI result: {result}")
+                
+                if 'choices' not in result or len(result['choices']) == 0:
+                    logging.error(f"Неожиданная структура ответа AI: {result}")
+                    raise Exception("Invalid AI response structure")
+                
+                ai_generated_prompt = result['choices'][0]['message']['content'].strip()
+                logging.info(f"AI вернул промпт: '{ai_generated_prompt}'")
+                
+                # Проверяем что промпт не пустой
+                if not ai_generated_prompt or len(ai_generated_prompt.strip()) < 10:
+                    logging.warning(f"AI вернул пустой промпт, используем fallback")
+                    raise Exception("Empty AI prompt")
+                
+                # Убеждаемся что промпт начинается правильно
+                if not ai_generated_prompt.lower().startswith('детская книжная иллюстрация'):
+                    if ai_generated_prompt.lower().startswith('иллюстрация'):
+                        ai_generated_prompt = "детская книжная " + ai_generated_prompt
+                    else:
+                        ai_generated_prompt = "детская книжная иллюстрация: " + ai_generated_prompt
+                
+                # Обновляем контекст
+                scene_summary = current_text[:100] + "..." if len(current_text) > 100 else current_text
+                update_image_context(user_id, text_part, scene_summary)
+                
+                logging.info(f"Финальный AI промпт: {ai_generated_prompt}")
+                return ai_generated_prompt
+                
+    except Exception as e:
+        logging.error(f"Ошибка генерации AI промпта: {e}")
+        # Fallback к контекстному методу
+        return create_image_prompt_with_context(user_id, state, text_part)
+
+def create_image_prompt_with_context(user_id, state, text_part):
+    """Улучшенный контекстный метод создания промптов"""
+    if user_id not in USER_IMAGE_CONTEXT:
+        init_image_context(user_id, state)
+    
+    context = USER_IMAGE_CONTEXT[user_id]
+    
+    # Извлекаем последние два предложения
+    sentences = re.split(r'[.!?]+', text_part)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    if len(sentences) >= 2:
+        current_text = '. '.join(sentences[-2:])
+    elif len(sentences) == 1:
+        current_text = sentences[0]
+    else:
+        current_text = text_part[:150] if text_part else ""
+    
+    # Создаем контекстный промпт
+    mood_map = {
+        'спокойное': 'спокойная мирная',
+        'волшебное': 'волшебная магическая',
+        'весёлое': 'радостная яркая',
+        'поучительное': 'мудрая добрая',
+        'фантастическое': 'фантастическая футуристическая',
+        'страшное': 'таинственная но не пугающая'
+    }
+    
+    mood_desc = mood_map.get(context['mood'], 'добрая')
+    
+    # Обновляем контекст
+    scene_summary = current_text[:100] + "..." if len(current_text) > 100 else current_text
+    update_image_context(user_id, text_part, scene_summary)
+    
+    # Создаем промпт с учетом контекста
+    prompt = f"детская книжная иллюстрация: {context['hero']} в месте {context['place']}, {current_text[:100]}, {mood_desc} атмосфера, яркие цвета, добрая детская книжная иллюстрация"
+    
+    logging.info(f"Создан контекстный промпт: {prompt}")
+    return prompt
+
+def create_image_prompt_fallback(state, text_part=None):
+    """Fallback функция для создания промптов (старый метод)"""
+    if text_part:
+        # Промпт на основе последних двух предложений блока
+        sentences = re.split(r'[.!?]+', text_part)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
         if len(sentences) >= 2:
             last_sentences = '. '.join(sentences[-2:])
         elif len(sentences) == 1:
             last_sentences = sentences[0]
         else:
-            # Если предложений нет, используем первые 200 символов как fallback
-            last_sentences = text_part[:200]
+            last_sentences = text_part[:200] if text_part else ""
         
         return f"иллюстрация к детской сказке: {last_sentences} в стиле детской книжной иллюстрации, яркие цвета, добрая атмосфера"
     else:
@@ -474,7 +664,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Генерируем первое изображение на основе параметров
         try:
-            initial_prompt = create_image_prompt(state)
+            initial_prompt = await generate_ai_image_prompt(user_id, state, is_initial=True)
             logging.info(f"Генерируем начальное изображение: {initial_prompt}")
             await context.bot.send_chat_action(chat_id=query.message.chat_id, action="upload_photo")
             
@@ -532,8 +722,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Генерируем изображение для каждой части (включая последнюю)
             try:
                 await context.bot.send_chat_action(chat_id=query.message.chat_id, action="upload_photo")
-                image_prompt = create_image_prompt(state, part)
-                logging.info(f"Генерируем изображение для части {i+1}: {image_prompt[:100]}...")
+                image_prompt = await generate_ai_image_prompt(user_id, state, part)
+                logging.info(f"Генерируем AI изображение для части {i+1}: {image_prompt[:100]}...")
                 image_path = await generate_image(image_prompt)
                 logging.info(f"Получен путь к изображению для части {i+1}: {image_path}")
                 
