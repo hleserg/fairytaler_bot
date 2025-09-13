@@ -1,0 +1,15 @@
+{
+  "modelUri": "art://b1g42huflfh8bn4mb5gm/yandex-art/latest",
+  "generationOptions": {
+    "seed": "1234",
+    "aspectRatio": {
+      "widthRatio": "2",
+      "heightRatio": "1"
+    }
+  },
+  "messages": [
+    {
+      "text": "детская иллюстрация: кот в сапогах"
+    }
+  ]
+}
